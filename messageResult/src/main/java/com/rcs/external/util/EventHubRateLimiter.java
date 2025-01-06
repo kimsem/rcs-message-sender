@@ -8,8 +8,8 @@ public class EventHubRateLimiter {
     private final RateLimiter rateLimiter;
 
     public EventHubRateLimiter() {
-        // 초당 처리할 메시지 수 (필요에 따라 조정)
-        this.rateLimiter = RateLimiter.create(100.0);
+        // 초당 처리량을 3000으로 증가
+        this.rateLimiter = RateLimiter.create(3000.0);
     }
 
     public void acquire(int permits) {
