@@ -12,6 +12,21 @@ spring:
       ddl-auto: validate
     show-sql: true
 
+message:
+  processing:
+    min-batch-size: 1000
+    max-batch-size: 3000
+    default-batch-size: 1000
+    min-threads: 1
+    max-threads: 48
+    default-threads: 10
+    min-event-hub-batch: 50
+    max-event-hub-batch: 500
+    default-event-hub-batch: 100
+    min-success-rate: 0
+    max-success-rate: 100
+    default-success-rate: 80
+
 eventhub:
   connectionString: ${EVENTHUB_CONNECTION_STRING}
 
@@ -24,4 +39,4 @@ springdoc:
 
 logging:
   level:
-    com.rcs.external: INFO
+    com.rcs.external: DEBUG
