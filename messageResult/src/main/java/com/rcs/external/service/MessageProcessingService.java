@@ -106,7 +106,7 @@ public class MessageProcessingService {
         }, batchSenderExecutor);
     }
 
-    @Scheduled(fixedDelay = 60000)
+    @Scheduled(fixedDelay = 120000)
     @Transactional
     public void processMessages() {
         try {
