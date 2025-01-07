@@ -173,11 +173,14 @@ public class MessageProcessingService {
                     int pageNumber = 0;
 
                     while (metrics.getProcessedCount() < totalCount) {
+                        log.info("메시지 그룹 {} DB 조회 시작", group.getMessageGroupId());
                         List<Message> messages = fetchMessagesInBatch(group.getMessageGroupId(), pageNumber);
                         if (messages.isEmpty()) {
                             break;
                         }
 
+                        // 이벤트 허브 전송 전에 로그 추가
+                        log.info("메시지 그룹 {} 이벤트 허브 전송 시작", group.getMessageGroupId());
                         for (Message message : messages) {
                             MessageResultEvent event = createMessageEvent(message);
                             EventData eventData = new EventData(objectMapper.writeValueAsString(event));
@@ -192,6 +195,11 @@ public class MessageProcessingService {
                         }
 
                         metrics.incrementProcessedCount(messages.size());
+
+                        log.info("메시지 그룹 {} 배치 처리 완료 ({}/{})",
+                                group.getMessageGroupId(),
+                                metrics.getProcessedCount(),
+                                totalCount);
 
                         if (metrics.getProcessedCount() % 1000 == 0) {
                             log.info("그룹 {} - {} / {} 메시지 처리됨 ({}), 처리율: {}/sec, 경과 시간: {:.2f}초",
@@ -215,11 +223,11 @@ public class MessageProcessingService {
                     metrics.complete();
                     updateMessageGroupStatus(group, metrics.getProcessedCount());
 
-                    log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지, 처리 시간: {:.2f}초, 평균 처리율: {}/sec",
+                    log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지, 처리 시간: {}초, 평균 처리율: {}/sec",
                             group.getMessageGroupId(),
                             metrics.getProcessedCount(),
                             String.format("%.2f", metrics.getDurationInSeconds()),
-                            metrics.getMessagesPerSecond());
+                            String.format("%.2f", metrics.getMessagesPerSecond()));
 
                 } finally {
                     metricsMap.remove(group.getMessageGroupId());
