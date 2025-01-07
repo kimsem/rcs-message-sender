@@ -28,13 +28,13 @@ message:
   processing:
     min-batch-size: 1000
     max-batch-size: 3000
-    default-batch-size: 2000
+    default-batch-size: 1000
     min-threads: 1
     max-threads: 47
-    default-threads: 20
+    default-threads: 10
     min-event-hub-batch: 50
     max-event-hub-batch: 500
-    default-event-hub-batch: 200
+    default-event-hub-batch: 100
     min-success-rate: 0
     max-success-rate: 100
     default-success-rate: 80
