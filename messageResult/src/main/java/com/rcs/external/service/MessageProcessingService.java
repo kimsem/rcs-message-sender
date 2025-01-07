@@ -143,40 +143,16 @@ public class MessageProcessingService {
     private CompletableFuture<Void> processGroupAsync(MessageGroup group) {
         return CompletableFuture.runAsync(() -> {
             try {
-                // total_count null 또는 0 체크
-                Integer totalCount = group.getTotalCount();
-                if (totalCount == null || totalCount == 0) {
-                    log.info("메시지 그룹 {} 처리 생략 - total_count가 {}입니다.",
-                            group.getMessageGroupId(),
-                            totalCount == null ? "null" : "0");
+                log.info("메시지 그룹 {} 처리 시작", group.getMessageGroupId());
+                EventDataBatch currentBatch = createNewBatch();
+                int processedCount = 0;
+                int pageNumber = 0;
 
-                    // 상태를 COMPLETED로 업데이트
-                    group.setStatus("COMPLETED");
-                    group.setProcessedCount(0);
-                    group.setUpdatedAt(LocalDateTime.now());
-                    messageGroupRepository.save(group);
-
-                    log.info("메시지 그룹 {} 상태가 COMPLETED로 업데이트됨 (처리 생략)",
-                            group.getMessageGroupId());
-                    return;
-                }
-
-                EventDataBatch currentBatch = null;
-                ProcessingMetrics metrics = new ProcessingMetrics(totalCount);
-                metricsMap.put(group.getMessageGroupId(), metrics);
-
-                try {
-                    log.info("메시지 그룹 {} 처리 시작 (total_count: {})",
-                            group.getMessageGroupId(), totalCount);
-
-                    currentBatch = createNewBatch();
-                    int pageNumber = 0;
-
-                    while (metrics.getProcessedCount() < totalCount) {
-                        List<Message> messages = fetchMessagesInBatch(group.getMessageGroupId(), pageNumber);
-                        if (messages.isEmpty()) {
-                            break;
-                        }
+                while (true) {
+                    List<Message> messages = fetchMessagesInBatch(group.getMessageGroupId(), pageNumber);
+                    if (messages.isEmpty()) {
+                        break;
+                    }
 
                         for (Message message : messages) {
                             MessageResultEvent event = createMessageEvent(message);
@@ -193,17 +169,9 @@ public class MessageProcessingService {
 
                         metrics.incrementProcessedCount(messages.size());
 
-                        if (metrics.getProcessedCount() % 1000 == 0) {
-                            log.info("그룹 {} - {} / {} 메시지 처리됨 ({}), 처리율: {}/sec, 경과 시간: {:.2f}초",
-                                    group.getMessageGroupId(),
-                                    metrics.getProcessedCount(),
-                                    totalCount,
-                                    metrics.getProgressPercentage(),
-                                    (int)(metrics.getProcessedCount() / metrics.getCurrentDurationInSeconds()),
-                                    metrics.getCurrentDurationInSeconds());
-
-                            updateMessageGroupProcessedCount(group, metrics.getProcessedCount());
-                        }
+                    if (processedCount % 1000 == 0) {
+                        log.info("그룹 {} - {} 메시지 처리됨", group.getMessageGroupId(), processedCount);
+                    }
 
                         pageNumber++;
                     }
@@ -212,15 +180,7 @@ public class MessageProcessingService {
                         batchQueue.put(currentBatch);
                     }
 
-                    metrics.complete();
-                    updateMessageGroupStatus(group, metrics.getProcessedCount());
-
-                    log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지, 처리 시간: {:.2f}초, 평균 처리율: {}/sec",
-                            group.getMessageGroupId(),
-                            metrics.getProcessedCount(),
-//                           처리시간 포맷 변경
-                            String.format("%.2f", metrics.getDurationInSeconds()),
-                            metrics.getMessagesPerSecond());
+                log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지", group.getMessageGroupId(), processedCount);
 
                 } finally {
                     metricsMap.remove(group.getMessageGroupId());
@@ -266,6 +226,25 @@ public class MessageProcessingService {
             log.error("메시지 조회 중 오류 발생: groupId={}, page={}", groupId, pageNumber, e);
             return Collections.emptyList();
         }
+    }
+
+    private CompletableFuture<Void> processMessageAsync(Message message, EventDataBatch batch) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                MessageResultEvent event = createMessageEvent(message);
+                EventData eventData = new EventData(objectMapper.writeValueAsString(event));
+
+                if (!batch.tryAdd(eventData)) {
+                    batchQueue.offer(batch);
+                    EventDataBatch newBatch = createNewBatch();
+                    if (!newBatch.tryAdd(eventData)) {
+                        throw new RuntimeException("Event too large for empty batch");
+                    }
+                }
+            } catch (Exception e) {
+                log.error("메시지 처리 중 오류: {}", message.getMessageId(), e);
+            }
+        }, batchSenderExecutor);
     }
 
     private EventDataBatch createNewBatch() {
