@@ -208,7 +208,7 @@ public class MessageProcessingService {
                                     totalCount,
                                     metrics.getProgressPercentage(),
                                     (int)(metrics.getProcessedCount() / metrics.getCurrentDurationInSeconds()),
-                                    metrics.getCurrentDurationInSeconds());
+                                    String.format("%.2f", metrics.getCurrentDurationInSeconds()));
 
                             updateMessageGroupProcessedCount(group, metrics.getProcessedCount());
                         }
