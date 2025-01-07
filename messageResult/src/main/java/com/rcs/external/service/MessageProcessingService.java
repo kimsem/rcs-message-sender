@@ -13,6 +13,7 @@ import com.rcs.external.domain.MessageGroup;
 import com.rcs.external.dto.MessageResultEvent;
 import com.rcs.external.repository.MessageGroupRepository;
 import com.rcs.external.repository.MessageRepository;
+import com.rcs.external.util.ProcessingMetrics;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -33,9 +34,11 @@ public class MessageProcessingService {
     private final MessageRepository messageRepository;
     private final EventHubProducerClient eventHubProducerClient;
     private final ObjectMapper objectMapper;
-    private final Queue<EventDataBatch> batchQueue;
+    private final BlockingQueue<EventDataBatch> batchQueue;
     private final ExecutorService batchSenderExecutor;
+    private final Map<String, ProcessingMetrics> metricsMap = new ConcurrentHashMap<>();
     private final Random random = new Random();
+    private volatile boolean isRunning = true;
 
     private final int batchSize;
     private final int maxThreads;
@@ -45,10 +48,10 @@ public class MessageProcessingService {
     public MessageProcessingService(
             MessageGroupRepository messageGroupRepository,
             MessageRepository messageRepository,
-            @Value("${message.processing.default-batch-size}") int batchSize,
-            @Value("${message.processing.default-threads}") int maxThreads,
-            @Value("${message.processing.default-event-hub-batch}") int eventHubBatchSize,
-            @Value("${message.processing.default-success-rate}") int successRate,
+            @Value("${message.processing.default-batch-size:1000}") int batchSize,
+            @Value("${message.processing.default-threads:10}") int maxThreads,
+            @Value("${message.processing.default-event-hub-batch:100}") int eventHubBatchSize,
+            @Value("${message.processing.default-success-rate:80}") int successRate,
             @Value("${eventhub.connection-string}") String eventHubConnectionString) {
 
         this.messageGroupRepository = messageGroupRepository;
@@ -62,7 +65,7 @@ public class MessageProcessingService {
                 .registerModule(new JavaTimeModule())
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
-        this.batchQueue = new ConcurrentLinkedQueue<>();
+        this.batchQueue = new LinkedBlockingQueue<>();
         this.batchSenderExecutor = Executors.newFixedThreadPool(maxThreads);
 
         this.eventHubProducerClient = new EventHubClientBuilder()
@@ -74,6 +77,7 @@ public class MessageProcessingService {
 
     @PreDestroy
     public void cleanup() {
+        isRunning = false;
         if (batchSenderExecutor != null) {
             batchSenderExecutor.shutdown();
             try {
@@ -93,14 +97,16 @@ public class MessageProcessingService {
 
     private void startBatchProcessor() {
         CompletableFuture.runAsync(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
+            while (isRunning) {
                 try {
-                    EventDataBatch batch = batchQueue.poll();
+                    EventDataBatch batch = batchQueue.poll(100, TimeUnit.MILLISECONDS);
                     if (batch != null && batch.getCount() > 0) {
                         sendBatchToEventHub(batch);
-                    } else {
-                        Thread.sleep(100);
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.error("배치 처리기가 중단되었습니다", e);
+                    break;
                 } catch (Exception e) {
                     log.error("배치 처리 중 오류 발생", e);
                 }
@@ -136,72 +142,88 @@ public class MessageProcessingService {
 
     private CompletableFuture<Void> processGroupAsync(MessageGroup group) {
         return CompletableFuture.runAsync(() -> {
+            EventDataBatch currentBatch = null;
+            ProcessingMetrics metrics = new ProcessingMetrics(group.getTotalCount());
+            metricsMap.put(group.getMessageGroupId(), metrics);
+
             try {
                 log.info("메시지 그룹 {} 처리 시작 (total_count: {})",
                         group.getMessageGroupId(), group.getTotalCount());
 
-                EventDataBatch currentBatch = createNewBatch();
-                int processedCount = 0;
+                currentBatch = createNewBatch();
                 int pageNumber = 0;
                 int totalCount = group.getTotalCount();
 
-                while (processedCount < totalCount) {
+                while (metrics.getProcessedCount() < totalCount) {
                     List<Message> messages = fetchMessagesInBatch(group.getMessageGroupId(), pageNumber);
                     if (messages.isEmpty()) {
                         break;
                     }
 
-                    List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
                     for (Message message : messages) {
-                        CompletableFuture<Void> future = processMessageAsync(message, currentBatch);
-                        batchFutures.add(future);
+                        MessageResultEvent event = createMessageEvent(message);
+                        EventData eventData = new EventData(objectMapper.writeValueAsString(event));
 
-                        if (currentBatch.getCount() >= eventHubBatchSize) {
-                            batchQueue.offer(currentBatch);
+                        if (!currentBatch.tryAdd(eventData)) {
+                            batchQueue.put(currentBatch);
                             currentBatch = createNewBatch();
+                            if (!currentBatch.tryAdd(eventData)) {
+                                throw new RuntimeException("Event too large for empty batch");
+                            }
                         }
                     }
 
-                    CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0])).join();
-                    processedCount += messages.size();
+                    metrics.incrementProcessedCount(messages.size());
 
-                    if (processedCount % 1000 == 0) {
-                        log.info("그룹 {} - {} / {} 메시지 처리됨",
-                                group.getMessageGroupId(), processedCount, totalCount);
-                        updateMessageGroupProcessedCount(group, processedCount);
+                    if (metrics.getProcessedCount() % 1000 == 0) {
+                        log.info("그룹 {} - {} / {} 메시지 처리됨 ({}), 처리율: {}/sec, 경과 시간: {:.2f}초",
+                                group.getMessageGroupId(),
+                                metrics.getProcessedCount(),
+                                totalCount,
+                                metrics.getProgressPercentage(),
+                                (int)(metrics.getProcessedCount() / metrics.getCurrentDurationInSeconds()),
+                                metrics.getCurrentDurationInSeconds());
+
+                        updateMessageGroupProcessedCount(group, metrics.getProcessedCount());
                     }
 
                     pageNumber++;
                 }
 
-                if (currentBatch.getCount() > 0) {
-                    batchQueue.offer(currentBatch);
+                if (currentBatch != null && currentBatch.getCount() > 0) {
+                    batchQueue.put(currentBatch);
                 }
 
-                // 모든 메시지 처리 완료 후 그룹 상태 업데이트
-                updateMessageGroupStatus(group, processedCount);
-                log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지",
-                        group.getMessageGroupId(), processedCount);
+                metrics.complete();
+                updateMessageGroupStatus(group, metrics.getProcessedCount());
+
+                log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지, 처리 시간: {:.2f}초, 평균 처리율: {}/sec",
+                        group.getMessageGroupId(),
+                        metrics.getProcessedCount(),
+                        metrics.getDurationInSeconds(),
+                        metrics.getMessagesPerSecond());
 
             } catch (Exception e) {
-                log.error("메시지 그룹 {} 처리 중 오류 발생", group.getMessageGroupId(), e);
+                log.error("메시지 그룹 {} 처리 중 오류 발생 (처리된 메시지: {}, 소요시간: {:.2f}초)",
+                        group.getMessageGroupId(),
+                        metrics.getProcessedCount(),
+                        metrics.getCurrentDurationInSeconds(),
+                        e);
+
+                if (currentBatch != null && currentBatch.getCount() > 0) {
+                    try {
+                        batchQueue.put(currentBatch);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        log.error("마지막 배치 추가 중 중단됨", ie);
+                    }
+                }
                 throw new RuntimeException(e);
+            } finally {
+                metricsMap.remove(group.getMessageGroupId());
             }
         }, batchSenderExecutor);
     }
-
-    private List<Message> fetchMessagesInBatch(String groupId, int pageNumber) {
-        try {
-            return messageRepository.findByMessageGroupIdWithPagination(
-                    groupId,
-                    PageRequest.of(pageNumber, batchSize)
-            ).getContent();
-        } catch (Exception e) {
-            log.error("메시지 조회 중 오류 발생: groupId={}, page={}", groupId, pageNumber, e);
-            return Collections.emptyList();
-        }
-    }
-
 
     @Transactional
     protected void updateMessageGroupProcessedCount(MessageGroup group, int processedCount) {
@@ -227,24 +249,16 @@ public class MessageProcessingService {
         }
     }
 
-
-    private CompletableFuture<Void> processMessageAsync(Message message, EventDataBatch batch) {
-        return CompletableFuture.runAsync(() -> {
-            try {
-                MessageResultEvent event = createMessageEvent(message);
-                EventData eventData = new EventData(objectMapper.writeValueAsString(event));
-
-                if (!batch.tryAdd(eventData)) {
-                    batchQueue.offer(batch);
-                    EventDataBatch newBatch = createNewBatch();
-                    if (!newBatch.tryAdd(eventData)) {
-                        throw new RuntimeException("Event too large for empty batch");
-                    }
-                }
-            } catch (Exception e) {
-                log.error("메시지 처리 중 오류: {}", message.getMessageId(), e);
-            }
-        }, batchSenderExecutor);
+    private List<Message> fetchMessagesInBatch(String groupId, int pageNumber) {
+        try {
+            return messageRepository.findByMessageGroupIdWithPagination(
+                    groupId,
+                    PageRequest.of(pageNumber, batchSize)
+            ).getContent();
+        } catch (Exception e) {
+            log.error("메시지 조회 중 오류 발생: groupId={}, page={}", groupId, pageNumber, e);
+            return Collections.emptyList();
+        }
     }
 
     private EventDataBatch createNewBatch() {
@@ -268,6 +282,12 @@ public class MessageProcessingService {
                     break;
                 }
                 log.warn("배치 전송 실패, 재시도 {}/{}", retryCount, maxRetries);
+                try {
+                    Thread.sleep(1000 * retryCount); // 재시도 간 지연 추가
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
     }
