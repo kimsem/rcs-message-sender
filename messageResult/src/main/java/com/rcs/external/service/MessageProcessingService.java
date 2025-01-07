@@ -21,6 +21,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
@@ -108,7 +109,7 @@ public class MessageProcessingService {
     }
 
     @Scheduled(fixedDelay = 5000)
-    @Transactional(readOnly = true)
+    @Transactional
     public void processMessages() {
         try {
             long startTime = System.currentTimeMillis();
@@ -136,12 +137,15 @@ public class MessageProcessingService {
     private CompletableFuture<Void> processGroupAsync(MessageGroup group) {
         return CompletableFuture.runAsync(() -> {
             try {
-                log.info("메시지 그룹 {} 처리 시작", group.getMessageGroupId());
+                log.info("메시지 그룹 {} 처리 시작 (total_count: {})",
+                        group.getMessageGroupId(), group.getTotalCount());
+
                 EventDataBatch currentBatch = createNewBatch();
                 int processedCount = 0;
                 int pageNumber = 0;
+                int totalCount = group.getTotalCount();
 
-                while (true) {
+                while (processedCount < totalCount) {
                     List<Message> messages = fetchMessagesInBatch(group.getMessageGroupId(), pageNumber);
                     if (messages.isEmpty()) {
                         break;
@@ -162,7 +166,9 @@ public class MessageProcessingService {
                     processedCount += messages.size();
 
                     if (processedCount % 1000 == 0) {
-                        log.info("그룹 {} - {} 메시지 처리됨", group.getMessageGroupId(), processedCount);
+                        log.info("그룹 {} - {} / {} 메시지 처리됨",
+                                group.getMessageGroupId(), processedCount, totalCount);
+                        updateMessageGroupProcessedCount(group, processedCount);
                     }
 
                     pageNumber++;
@@ -172,7 +178,10 @@ public class MessageProcessingService {
                     batchQueue.offer(currentBatch);
                 }
 
-                log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지", group.getMessageGroupId(), processedCount);
+                // 모든 메시지 처리 완료 후 그룹 상태 업데이트
+                updateMessageGroupStatus(group, processedCount);
+                log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지",
+                        group.getMessageGroupId(), processedCount);
 
             } catch (Exception e) {
                 log.error("메시지 그룹 {} 처리 중 오류 발생", group.getMessageGroupId(), e);
@@ -192,6 +201,32 @@ public class MessageProcessingService {
             return Collections.emptyList();
         }
     }
+
+
+    @Transactional
+    protected void updateMessageGroupProcessedCount(MessageGroup group, int processedCount) {
+        try {
+            group.setProcessedCount(processedCount);
+            group.setUpdatedAt(LocalDateTime.now());
+            messageGroupRepository.save(group);
+        } catch (Exception e) {
+            log.error("메시지 그룹 처리 수 업데이트 중 오류 발생: {}", group.getMessageGroupId(), e);
+        }
+    }
+
+    @Transactional
+    protected void updateMessageGroupStatus(MessageGroup group, int finalProcessedCount) {
+        try {
+            group.setProcessedCount(finalProcessedCount);
+            group.setStatus("COMPLETED");
+            group.setUpdatedAt(LocalDateTime.now());
+            messageGroupRepository.save(group);
+            log.info("메시지 그룹 {} 상태가 COMPLETED로 업데이트됨", group.getMessageGroupId());
+        } catch (Exception e) {
+            log.error("메시지 그룹 상태 업데이트 중 오류 발생: {}", group.getMessageGroupId(), e);
+        }
+    }
+
 
     private CompletableFuture<Void> processMessageAsync(Message message, EventDataBatch batch) {
         return CompletableFuture.runAsync(() -> {
