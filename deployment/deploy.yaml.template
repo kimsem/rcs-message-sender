@@ -1,0 +1,111 @@
+# ConfigMap for Application Settings
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${userid}-rcs-config
+  namespace: ${app_namespace}
+data:
+  # Application Settings
+  APP_NAME: "rcs"
+  SERVER_PORT: "8080"
+
+  # Database Connections
+  MESSAGE_DB_URL: "jdbc:postgresql://10.0.215.208:5432/rcs-message-db"
+  MESSAGE_DB_USERNAME: "dg4s"
+  MESSAGE_DB_PASSWORD: "p@ssw0rd!@"
+
+  # JPA Settings
+  JPA_DDL_AUTO: "update"
+  JPA_SHOW_SQL: "true"
+
+  #EVENTHUB
+  EVENTHUB_CONNECTION_STRING: "Endpoint=sb://dg4us-eventhub-ns.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=ABUzYkX9Ca3F3Xo4b6bi0Mf+HuqRA12qA+AEhCsri3A="
+  # 수신번호 암호화 요청 큐
+  EVENTHUB_ENCRYPT_NUM_REQ: "number-encrypt-requests"
+  # 메시지 발송 요청 큐
+  EVENTHUB_MESSAGE_SEND_REQ: "rcs-message-send"
+  # 메시지 수신결과 응답 큐
+  EVENTHUB_MESSAGE_RESULT_RES: "rcs-message-result"
+  # 미사용
+  ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
+
+---
+# messageResult Service Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${userid}-message-result
+  namespace: ${app_namespace}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: message-result-service
+      userid: ${userid}
+  template:
+    metadata:
+      labels:
+        app: message-result-service
+        userid: ${userid}
+    spec:
+      containers:
+      - name: message-result-service
+        image: ${messageResult_image_path}
+        imagePullPolicy: Always
+        env:
+        - name: MESSAGE_DB_URL
+          valueFrom:
+            configMapKeyRef:
+              name: ${userid}-rcs-config
+              key: MESSAGE_DB_URL
+        - name: MESSAGE_DB_USERNAME
+          valueFrom:
+            configMapKeyRef:
+              name: ${userid}-rcs-config
+              key: MESSAGE_DB_USERNAME
+        - name: MESSAGE_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ${userid}-db-credentials
+              key: MESSAGE_DB_PASSWORD
+        - name: EVENTHUB_CONNECTION_STRING
+          valueFrom:
+            configMapKeyRef:
+              name: ${userid}-rcs-config
+              key: EVENTHUB_CONNECTION_STRING
+        - name: azure.eventhub.connection-string
+          valueFrom:
+            configMapKeyRef:
+              name: ${userid}-rcs-config
+              key: EVENTHUB_CONNECTION_STRING
+        - name: EVENTHUB_ENCRYPT_NUM_REQ
+          value: "number-encrypt-requests"
+        - name: EVENTHUB_MESSAGE_SEND_REQ
+          value: "rcs-message-send"
+        - name: EVENTHUB_MESSAGE_RESULT_RES
+          value: "rcs-message-result"
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 500m
+            memory: 1024Mi
+
+---
+# messageResult Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${userid}-rcs-message-result
+  namespace: ${app_namespace}
+spec:
+  selector:
+    app: rcs-mvp-sender
+    userid: ${userid}
+  ports:
+    - port: 8080
+      targetPort: 9081
+  type: LoadBalancer
+
+---
