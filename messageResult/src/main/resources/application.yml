@@ -50,3 +50,6 @@ springdoc:
 logging:
   level:
     com.rcs.external: INFO
+    org.hibernate: WARN          # Hibernate 로그 레벨을 WARN으로 설정
+    org.hibernate.SQL: OFF       # SQL 로그 완전 비활성화
+    org.springframework: WARN    # Spring 프레임워크 로그도 WARN으로 설정
