@@ -143,44 +143,50 @@ public class MessageProcessingService {
     private CompletableFuture<Void> processGroupAsync(MessageGroup group) {
         return CompletableFuture.runAsync(() -> {
             try {
-                log.info("메시지 그룹 {} 처리 시작", group.getMessageGroupId());
+                log.info("메시지 그룹 {} 처리 시작 (total_count: {})",
+                        group.getMessageGroupId(), group.getTotalCount());
+
                 EventDataBatch currentBatch = createNewBatch();
                 int processedCount = 0;
                 int pageNumber = 0;
 
-                while (true) {
+                while (processedCount < totalCount) {
                     List<Message> messages = fetchMessagesInBatch(group.getMessageGroupId(), pageNumber);
                     if (messages.isEmpty()) {
                         break;
                     }
 
-                        for (Message message : messages) {
-                            MessageResultEvent event = createMessageEvent(message);
-                            EventData eventData = new EventData(objectMapper.writeValueAsString(event));
+                    List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
+                    for (Message message : messages) {
+                        CompletableFuture<Void> future = processMessageAsync(message, currentBatch);
+                        batchFutures.add(future);
 
-                            if (!currentBatch.tryAdd(eventData)) {
-                                batchQueue.put(currentBatch);
-                                currentBatch = createNewBatch();
-                                if (!currentBatch.tryAdd(eventData)) {
-                                    throw new RuntimeException("Event too large for empty batch");
-                                }
-                            }
+                        if (currentBatch.getCount() >= eventHubBatchSize) {
+                            batchQueue.offer(currentBatch);
+                            currentBatch = createNewBatch();
                         }
+                    }
 
-                        metrics.incrementProcessedCount(messages.size());
+                    CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0])).join();
+                    processedCount += messages.size();
 
                     if (processedCount % 1000 == 0) {
-                        log.info("그룹 {} - {} 메시지 처리됨", group.getMessageGroupId(), processedCount);
+                        log.info("그룹 {} - {} / {} 메시지 처리됨",
+                                group.getMessageGroupId(), processedCount, totalCount);
+                        updateMessageGroupProcessedCount(group, processedCount);
                     }
 
                         pageNumber++;
                     }
 
-                    if (currentBatch != null && currentBatch.getCount() > 0) {
-                        batchQueue.put(currentBatch);
-                    }
+                if (currentBatch.getCount() > 0) {
+                    batchQueue.offer(currentBatch);
+                }
 
-                log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지", group.getMessageGroupId(), processedCount);
+                // 모든 메시지 처리 완료 후 그룹 상태 업데이트
+                updateMessageGroupStatus(group, processedCount);
+                log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지",
+                        group.getMessageGroupId(), processedCount);
 
                 } finally {
                     metricsMap.remove(group.getMessageGroupId());
@@ -216,17 +222,6 @@ public class MessageProcessingService {
         }
     }
 
-    private List<Message> fetchMessagesInBatch(String groupId, int pageNumber) {
-        try {
-            return messageRepository.findByMessageGroupIdWithPagination(
-                    groupId,
-                    PageRequest.of(pageNumber, batchSize)
-            ).getContent();
-        } catch (Exception e) {
-            log.error("메시지 조회 중 오류 발생: groupId={}, page={}", groupId, pageNumber, e);
-            return Collections.emptyList();
-        }
-    }
 
     private CompletableFuture<Void> processMessageAsync(Message message, EventDataBatch batch) {
         return CompletableFuture.runAsync(() -> {
