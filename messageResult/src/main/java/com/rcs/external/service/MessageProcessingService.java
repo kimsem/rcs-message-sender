@@ -218,7 +218,8 @@ public class MessageProcessingService {
                     log.info("메시지 그룹 {} 처리 완료 - 총 {} 메시지, 처리 시간: {:.2f}초, 평균 처리율: {}/sec",
                             group.getMessageGroupId(),
                             metrics.getProcessedCount(),
-                            metrics.getDurationInSeconds(),
+//                           처리시간 포맷 변경
+                            String.format("%.2f", metrics.getDurationInSeconds()),
                             metrics.getMessagesPerSecond());
 
                 } finally {
