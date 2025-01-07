@@ -1,0 +1,189 @@
+name: RCS Message-sender Application CI/CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      USERID:
+        description: 'User ID for resource naming (lowercase letters and numbers only)'
+        required: true
+        default: 'dg4us'
+        type: string
+
+env:
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  LOCATION: ${{ vars.LOCATION }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set_tag.outputs.image_tag }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set image tag
+        id: set_tag
+        run: |
+          echo "image_tag=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+      - name: Set up JDK 23
+        uses: actions/setup-java@v3
+        with:
+          java-version: '23'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Build Applications
+        run: |
+          chmod +x gradlew
+          ./gradlew messageResult:clean messageResult:build -x test
+      - name: Check build outputs
+        run: |
+          for service in messageResult; do
+            echo "Checking ${service} build output..."
+            ls -la ${service}/build/libs/
+          done
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: |
+            */build/libs/
+            deployment/
+            Dockerfile
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ needs.build.outputs.image_tag }}
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: .
+
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ github.event.inputs.USERID }}cr.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and Push Container Images
+        env:
+          IMAGE_REG: ${{ github.event.inputs.USERID }}cr.azurecr.io
+          IMAGE_ORG: rcs
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          for service in messageResult;
+          do
+            echo "Building ${service} service image..."
+            
+            # Create Dockerfile content
+            echo "FROM eclipse-temurin:23-jdk-alpine" > "Dockerfile.${service}"
+            echo "COPY ${service}/build/libs/messageResult-0.0.1-SNAPSHOT.jar app.jar" >> "Dockerfile.${service}"
+            echo 'ENTRYPOINT ["java","-jar","/app.jar"]' >> "Dockerfile.${service}"
+            
+            # Build Docker image
+            docker build -f "Dockerfile.${service}" \
+              -t "${IMAGE_REG}/${IMAGE_ORG}/rcs-message-sender:${IMAGE_TAG}" \
+              -t "${IMAGE_REG}/${IMAGE_ORG}/rcs-message-sender:latest" .
+            
+            # Push Docker images
+            docker push "${IMAGE_REG}/${IMAGE_ORG}/rcs-message-sender:${IMAGE_TAG}"
+            docker push "${IMAGE_REG}/${IMAGE_ORG}/rcs-message-sender:latest"
+          done
+  deploy:
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: .
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up kubelogin
+        uses: azure/use-kubelogin@v1
+        with:
+          kubelogin-version: 'v0.0.25'
+
+      - name: Get AKS Credentials
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ github.event.inputs.USERID }}-aks
+
+      - name: Create Namespaces and Secrets
+        env:
+          APP_NAMESPACE: rcs-mvp-sender
+        run: |
+          # Az CLI로 AKS 자격증명 갱신
+          az aks get-credentials \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ github.event.inputs.USERID }}-aks \
+            --overwrite-existing
+            
+          kubectl create namespace ${APP_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+          
+          kubectl create secret generic 'dg4us-db-credentials' \
+            --namespace ${APP_NAMESPACE} \
+            --from-literal=MONGODB_DB_PASSWORD='${{ secrets.MONGODB_PASSWORD }}' \
+            --from-literal=MESSAGE_DB_PASSWORD='${{ secrets.RCS_DB_PASSWORD }}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Generate and Apply Deployment
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          IMAGE_REG: ${{ github.event.inputs.USERID }}cr.azurecr.io
+          IMAGE_ORG: rcs
+          APP_NAMESPACE: rcs-mvp-sender
+          USERID: ${{ github.event.inputs.USERID }}
+        run: |
+          # Set variables for envsubst
+          export messageResult_image_path="${IMAGE_REG}/${IMAGE_ORG}/rcs-message-sender:${IMAGE_TAG}"          
+          export userid="${USERID}"
+          export app_namespace="${APP_NAMESPACE}"
+          
+          # Generate manifest
+          envsubst < deployment/deploy.yaml.template > deployment/deploy.yaml
+          
+          # Display for verification
+          echo "Generated deployment manifest:"
+          cat deployment/deploy.yaml
+          
+          # Apply manifest
+          kubectl apply -f deployment/deploy.yaml
+      - name: Verify Deployment
+        env:
+          APP_NAMESPACE: rcs-mvp-sender
+        run: |
+          for service in message-result; do
+            echo "Waiting for ${service} service..."
+            kubectl wait --for=condition=ready pod \
+              -l "app=${service},userid=${{ github.event.inputs.USERID }}" \
+              -n ${APP_NAMESPACE} --timeout=600s || true
+              
+            IP=$(kubectl get svc ${{ github.event.inputs.USERID }}-rcs-${service} \
+              -n ${APP_NAMESPACE} \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            echo "${service} Service IP: ${IP}"
+            
+            if [ -z "${IP}" ]; then
+              echo "Error: ${service} service IP not available"
+              exit 1
+            fi
+          done
