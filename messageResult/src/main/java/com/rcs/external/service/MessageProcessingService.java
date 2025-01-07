@@ -115,6 +115,23 @@ public class MessageProcessingService {
             int pageNumber = 0;
             EventDataBatch currentBatch = createNewBatch();
 
+            // DB 연결 확인
+            try {
+                messageRepository.count();
+            } catch (Exception e) {
+                log.error("데이터베이스 연결 오류. 다음 스케줄에서 재시도합니다.", e);
+                return;
+            }
+
+            // 이벤트 허브 연결 확인
+            try {
+                eventHubProducerClient.createBatch();
+            } catch (Exception e) {
+                log.error("이벤트 허브 연결 오류. 다음 스케줄에서 재시도합니다.", e);
+                return;
+            }
+
+
             log.info("메시지 처리 작업을 시작합니다. (batchSize={})", batchSize);
 
             while (true) {

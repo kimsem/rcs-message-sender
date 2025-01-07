@@ -10,11 +10,13 @@ spring:
     hikari:
       maximum-pool-size: 10
       minimum-idle: 5
-      idle-timeout: 300000        # 5분
-      max-lifetime: 1200000       # 20분
-      connection-timeout: 20000   # 20초
-      validation-timeout: 5000    # 5초
+      idle-timeout: 300000       # 5분
+      max-lifetime: 600000       # 10분 (기존 20분에서 줄임)
+      connection-timeout: 20000
+      validation-timeout: 5000
+      connection-test-query: SELECT 1
       pool-name: HikariPool
+      connection-init-sql: SELECT 1
   jpa:
     hibernate:
       ddl-auto: validate
@@ -26,7 +28,7 @@ message:
   processing:
     min-batch-size: 1000
     max-batch-size: 3000
-    default-batch-size: 3000
+    default-batch-size: 2000
     min-threads: 1
     max-threads: 47
     default-threads: 20
