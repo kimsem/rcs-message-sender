@@ -7,10 +7,20 @@ spring:
     username: ${MESSAGE_DB_USERNAME}
     password: ${MESSAGE_DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      idle-timeout: 300000        # 5분
+      max-lifetime: 1200000       # 20분
+      connection-timeout: 20000   # 20초
+      validation-timeout: 5000    # 5초
+      pool-name: HikariPool
   jpa:
     hibernate:
       ddl-auto: validate
-    show-sql: true
+    show-sql: false
+    open-in-view: false   # 경고 제거를 위해 추가
+
 
 message:
   processing:
