@@ -91,8 +91,10 @@ public class MessageProcessingService {
 
                         if (!currentBatch.tryAdd(eventData)) {
                             // 현재 배치가 가득 찼을 때
+
+                            updateMessageStatuses(messageIds);
                             if (sendBatchToEventHub(currentBatch)) {
-                                updateMessageStatuses(messageIds);
+//                                updateMessageStatuses(messageIds);
                             }
                             messageIds.clear();
 
@@ -107,8 +109,9 @@ public class MessageProcessingService {
 
                         // 업데이트 배치 크기에 도달하면 상태 업데이트
                         if (messageIds.size() >= updateBatchSize) {
+                            updateMessageStatuses(messageIds);
                             if (sendBatchToEventHub(currentBatch)) {
-                                updateMessageStatuses(messageIds);
+//                                updateMessageStatuses(messageIds);
                             }
                             messageIds.clear();
                             currentBatch = createNewBatch();
@@ -125,8 +128,9 @@ public class MessageProcessingService {
 
             // 남은 메시지 처리
             if (!messageIds.isEmpty()) {
+                updateMessageStatuses(messageIds);
                 if (sendBatchToEventHub(currentBatch)) {
-                    updateMessageStatuses(messageIds);
+//                    updateMessageStatuses(messageIds);
                 }
             }
 
