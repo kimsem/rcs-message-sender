@@ -185,7 +185,7 @@ public class MessageProcessingService {
         try {
             messageRepository.updateMessagesStatus(messageIds, STATUS_SENDING);
         } catch (Exception e) {
-            log.error("메 시지 상태 업데이트 중 오류 발생. messageIds: {}", messageIds.size(), e);
+            log.error("메시지 상태 업데이트 중 오류 발생. messageIds: {}", messageIds.size(), e);
             throw e;
         }
     }
