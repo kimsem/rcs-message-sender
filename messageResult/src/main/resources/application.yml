@@ -18,11 +18,11 @@ spring:
       pool-name: HikariPool
       connection-init-sql: SELECT 1
   jpa:
-    hibernate:
-      ddl-auto: validate
-    format_sql: true
-    show-sql: true
-    open-in-view: false   # 경고 제거를 위해 추가
+    properties:
+      hibernate:
+        format_sql: true             # SQL 포맷팅
+        use_sql_comments: true       # JPQL 주석 출력
+    show-sql: true                   # SQL 콘솔 출력
 
 
 message:
@@ -57,3 +57,4 @@ logging:
     org.hibernate.SQL: DEBUG    # SQL 쿼리 출력
     org.hibernate.type.descriptor.sql: TRACE  # SQL 쿼리 파라미터 값까지 출력
     org.springframework: WARN
+    org.hibernate.orm.jdbc.bind: TRACE # 바인딩 파라미터 출력 (Hibernate 6.x 이상)
