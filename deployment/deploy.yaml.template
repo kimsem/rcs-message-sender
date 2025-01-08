@@ -10,7 +10,7 @@ data:
   SERVER_PORT: "8080"
 
   # Database Connections
-  MESSAGE_DB_URL: "jdbc:postgresql://10.0.215.208:5432/rcs-message-db"
+  MESSAGE_DB_URL: "jdbc:postgresql://20.41.121.201:5432/rcs-message-db"
   MESSAGE_DB_USERNAME: "dg4s"
   MESSAGE_DB_PASSWORD: "p@ssw0rd!@"
 
