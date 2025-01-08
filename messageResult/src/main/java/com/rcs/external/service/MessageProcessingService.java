@@ -69,6 +69,7 @@ public class MessageProcessingService {
         try {
             long startTime = System.currentTimeMillis();
             long processedCount = 0;
+            long sentCount = 0;
 
             // DB 및 이벤트 허브 연결 확인
             if (!checkConnections()) {
@@ -88,12 +89,14 @@ public class MessageProcessingService {
                     try {
                         MessageResultEvent event = createMessageEvent(message);
                         EventData eventData = new EventData(objectMapper.writeValueAsString(event));
+                        processedCount++;
 
                         if (!currentBatch.tryAdd(eventData)) {
                             // 현재 배치가 가득 찼을 때
-
                             if (sendBatchToEventHub(currentBatch)) {
                                 updateMessageStatuses(messageIds);
+                                sentCount += currentBatch.getCount();
+                                log.info("배치 전송 완료 - 전송건수: {}, 총 처리건수: {}", currentBatch.getCount(), processedCount);
                             }
                             messageIds.clear();
 
@@ -104,19 +107,20 @@ public class MessageProcessingService {
                         }
 
                         messageIds.add(message.getMessageId());
-                        processedCount++;
 
                         // 업데이트 배치 크기에 도달하면 상태 업데이트
                         if (messageIds.size() >= updateBatchSize) {
                             if (sendBatchToEventHub(currentBatch)) {
                                 updateMessageStatuses(messageIds);
+                                sentCount += currentBatch.getCount();
+                                log.info("배치 전송 완료 - 전송건수: {}, 총 처리건수: {}", currentBatch.getCount(), processedCount);
                             }
                             messageIds.clear();
                             currentBatch = createNewBatch();
                         }
 
                         if (processedCount % 1000 == 0) {
-                            logProgress(processedCount, startTime);
+                            logProgress(processedCount, sentCount, startTime);
                         }
                     } catch (Exception e) {
                         log.error("메시지 처리 중 오류 발생: {}", message.getMessageId(), e);
@@ -128,10 +132,12 @@ public class MessageProcessingService {
             if (!messageIds.isEmpty()) {
                 if (sendBatchToEventHub(currentBatch)) {
                     updateMessageStatuses(messageIds);
+                    sentCount += currentBatch.getCount();
+                    log.info("마지막 배치 전송 완료 - 전송건수: {}, 총 처리건수: {}", currentBatch.getCount(), processedCount);
                 }
             }
 
-            logCompletion(processedCount, startTime);
+            logCompletion(processedCount, sentCount, startTime);
 
         } catch (Exception e) {
             log.error("메시지 처리 중 오류 발생", e);
@@ -147,19 +153,21 @@ public class MessageProcessingService {
         }
     }
 
-    private void logProgress(long processedCount, long startTime) {
+    private void logProgress(long processedCount, long sentCount, long startTime) {
         double elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000.0;
         double rate = processedCount / elapsedSeconds;
-        log.info("{} 메시지 처리됨, 처리율: {}/sec",
+        log.info("처리현황 - 처리건수: {}, 전송건수: {}, 처리율: {}/sec",
                 processedCount,
+                sentCount,
                 String.format("%.2f", rate));
     }
 
-    private void logCompletion(long processedCount, long startTime) {
+    private void logCompletion(long processedCount, long sentCount, long startTime) {
         double totalSeconds = (System.currentTimeMillis() - startTime) / 1000.0;
         double averageRate = processedCount / totalSeconds;
-        log.info("메시지 처리 완료 - 총 {} 메시지, 처리 시간: {}초, 평균 처리율: {}/sec",
+        log.info("처리 완료 - 총 처리건수: {}, 총 전송건수: {}, 처리 시간: {}초, 평균 처리율: {}/sec",
                 processedCount,
+                sentCount,
                 String.format("%.2f", totalSeconds),
                 String.format("%.2f", averageRate));
     }
