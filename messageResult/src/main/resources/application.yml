@@ -28,7 +28,7 @@ message:
   processing:
     min-batch-size: 1000
     max-batch-size: 3000
-    default-batch-size: 1000
+    default-batch-size: 500
     min-threads: 1
     max-threads: 47
     default-threads: 10
