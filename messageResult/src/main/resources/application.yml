@@ -20,7 +20,8 @@ spring:
   jpa:
     hibernate:
       ddl-auto: validate
-    show-sql: false
+    format_sql: true
+    show-sql: true
     open-in-view: false   # 경고 제거를 위해 추가
 
 
@@ -52,6 +53,7 @@ springdoc:
 logging:
   level:
     com.rcs.external: INFO
-    org.hibernate: WARN          # Hibernate 로그 레벨을 WARN으로 설정
-    org.hibernate.SQL: INFO       # SQL 로그 완전 비활성화
-    org.springframework: WARN    # Spring 프레임워크 로그도 WARN으로 설정
+    org.hibernate: INFO
+    org.hibernate.SQL: DEBUG    # SQL 쿼리 출력
+    org.hibernate.type.descriptor.sql: TRACE  # SQL 쿼리 파라미터 값까지 출력
+    org.springframework: WARN
