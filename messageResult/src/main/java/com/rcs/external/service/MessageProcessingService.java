@@ -21,11 +21,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Random;
-import java.util.concurrent.*;
-import java.util.stream.Stream;
 
 @Slf4j
 @Service
@@ -64,7 +61,6 @@ public class MessageProcessingService {
     }
 
     @Scheduled(fixedDelay = 5000)
-    @Transactional
     public void processMessages() {
         try {
             long startTime = System.currentTimeMillis();
@@ -78,26 +74,29 @@ public class MessageProcessingService {
 
             log.info("PENDING 상태의 메시지 처리 작업을 시작합니다. (batchSize={})", batchSize);
 
-            List<String> messageIds = new ArrayList<>(updateBatchSize);
-            EventDataBatch currentBatch = createNewBatch();
+            boolean hasMoreMessages = true;
+            int pageNumber = 0;
 
-            try (Stream<Message> messageStream = messageRepository.findByStatusOrderByMessageId(STATUS_PENDING)) {
-                Iterator<Message> iterator = messageStream.iterator();
+            while (hasMoreMessages) {
+                // 페이지 단위로 메시지 조회
+                List<Message> messages = getPagedMessages(pageNumber);
+                if (messages.isEmpty()) {
+                    hasMoreMessages = false;
+                    continue;
+                }
 
-                while (iterator.hasNext()) {
-                    Message message = iterator.next();
+                List<String> messageIds = new ArrayList<>(updateBatchSize);
+                EventDataBatch currentBatch = createNewBatch();
+
+                for (Message message : messages) {
                     try {
                         MessageResultEvent event = createMessageEvent(message);
                         EventData eventData = new EventData(objectMapper.writeValueAsString(event));
                         processedCount++;
 
                         if (!currentBatch.tryAdd(eventData)) {
-                            // 현재 배치가 가득 찼을 때
-                            if (sendBatchToEventHub(currentBatch)) {
-                                updateMessageStatuses(messageIds);
-                                sentCount += currentBatch.getCount();
-                                log.info("배치 전송 완료 - 전송건수: {}, 총 처리건수: {}", currentBatch.getCount(), processedCount);
-                            }
+                            processBatch(currentBatch, messageIds, processedCount);
+                            sentCount += currentBatch.getCount();
                             messageIds.clear();
 
                             currentBatch = createNewBatch();
@@ -108,13 +107,9 @@ public class MessageProcessingService {
 
                         messageIds.add(message.getMessageId());
 
-                        // 업데이트 배치 크기에 도달하면 상태 업데이트
                         if (messageIds.size() >= updateBatchSize) {
-                            if (sendBatchToEventHub(currentBatch)) {
-                                updateMessageStatuses(messageIds);
-                                sentCount += currentBatch.getCount();
-                                log.info("배치 전송 완료 - 전송건수: {}, 총 처리건수: {}", currentBatch.getCount(), processedCount);
-                            }
+                            processBatch(currentBatch, messageIds, processedCount);
+                            sentCount += currentBatch.getCount();
                             messageIds.clear();
                             currentBatch = createNewBatch();
                         }
@@ -126,21 +121,35 @@ public class MessageProcessingService {
                         log.error("메시지 처리 중 오류 발생: {}", message.getMessageId(), e);
                     }
                 }
-            }
 
-            // 남은 메시지 처리
-            if (!messageIds.isEmpty()) {
-                if (sendBatchToEventHub(currentBatch)) {
-                    updateMessageStatuses(messageIds);
+                // 남은 메시지 처리
+                if (!messageIds.isEmpty()) {
+                    processBatch(currentBatch, messageIds, processedCount);
                     sentCount += currentBatch.getCount();
-                    log.info("마지막 배치 전송 완료 - 전송건수: {}, 총 처리건수: {}", currentBatch.getCount(), processedCount);
                 }
+
+                pageNumber++;
             }
 
             logCompletion(processedCount, sentCount, startTime);
 
         } catch (Exception e) {
             log.error("메시지 처리 중 오류 발생", e);
+        }
+    }
+
+    @Transactional(readOnly = true)
+    protected List<Message> getPagedMessages(int pageNumber) {
+        Page<Message> messagePage = messageRepository.findByStatus(STATUS_PENDING,
+                PageRequest.of(pageNumber, batchSize));
+        return messagePage.getContent();
+    }
+
+    @Transactional
+    protected void processBatch(EventDataBatch batch, List<String> messageIds, long processedCount) {
+        if (sendBatchToEventHub(batch)) {
+            updateMessageStatuses(messageIds);
+            log.info("배치 전송 완료 - 전송건수: {}, 총 처리건수: {}", batch.getCount(), processedCount);
         }
     }
 
@@ -179,7 +188,6 @@ public class MessageProcessingService {
         while (retryCount < maxRetries) {
             try {
                 eventHubProducerClient.send(batch);
-                log.info("배치 전송 완료 (size: {})", batch.getCount());
                 return true;
             } catch (Exception e) {
                 retryCount++;
