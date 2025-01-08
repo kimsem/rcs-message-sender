@@ -268,7 +268,7 @@ public class MessageProcessingService {
     private void logCompletion(long processedCount, long sentCount, long startTime) {
         double totalSeconds = (System.currentTimeMillis() - startTime) / 1000.0;
         double averageRate = processedCount / totalSeconds;
-        log.info("처리 완료 - 총 처리건수: {}, 총 전송건수: {}, 처리 시간: {}초, 평균 처리율: {}/sec",
+        log.info("[처리 완료] - 총 처리건수: {}, 총 전송건수: {}, 처리 시간: {}초, 평균 처리율: {}/sec",
                 processedCount,
                 sentCount,
                 String.format("%.2f", totalSeconds),
