@@ -20,12 +20,17 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.*;
 
 @Slf4j
 @Service
 public class MessageProcessingService {
+    private static final String STATUS_PENDING = "PENDING";
+    private static final String STATUS_SENDING = "SENDING";
+
     private final MessageRepository messageRepository;
     private final EventHubProducerClient eventHubProducerClient;
     private final ObjectMapper objectMapper;
@@ -67,24 +72,157 @@ public class MessageProcessingService {
         startBatchProcessor();
     }
 
-    @PreDestroy
-    public void cleanup() {
-        isRunning = false;
-        if (batchSenderExecutor != null) {
-            batchSenderExecutor.shutdown();
-            try {
-                if (!batchSenderExecutor.awaitTermination(60, TimeUnit.SECONDS)) {
-                    batchSenderExecutor.shutdownNow();
+    @Scheduled(fixedDelay = 5000)
+    @Transactional
+    public void processMessages() {
+        try {
+            long startTime = System.currentTimeMillis();
+            long processedCount = 0;
+            int pageNumber = 0;
+            EventDataBatch currentBatch = createNewBatch();
+            List<Message> batchMessages = new ArrayList<>();
+
+            // DB 및 이벤트 허브 연결 확인
+            if (!checkConnections()) {
+                return;
+            }
+
+            log.info("PENDING 상태의 메시지 처리 작업을 시작합니다. (batchSize={})", batchSize);
+
+            while (true) {
+                Page<Message> messages = messageRepository.findByStatus(STATUS_PENDING, PageRequest.of(pageNumber, batchSize));
+                if (messages.isEmpty()) {
+                    break;
                 }
-            } catch (InterruptedException e) {
-                batchSenderExecutor.shutdownNow();
-                Thread.currentThread().interrupt();
+
+                for (Message message : messages) {
+                    try {
+                        MessageResultEvent event = createMessageEvent(message);
+                        EventData eventData = new EventData(objectMapper.writeValueAsString(event));
+
+                        if (!currentBatch.tryAdd(eventData)) {
+                            // 현재 배치가 가득 찼을 때 처리
+                            if (sendBatchToEventHub(currentBatch)) {
+                                updateMessagesStatus(batchMessages);
+                            }
+                            batchMessages.clear();
+
+                            currentBatch = createNewBatch();
+                            if (!currentBatch.tryAdd(eventData)) {
+                                throw new RuntimeException("Event too large for empty batch");
+                            }
+                        }
+
+                        batchMessages.add(message);
+                        processedCount++;
+
+                        if (processedCount % 1000 == 0) {
+                            double elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000.0;
+                            double rate = processedCount / elapsedSeconds;
+                            log.info("{} 메시지 처리됨, 처리율: {}/sec",
+                                    processedCount,
+                                    String.format("%.2f", rate));
+                        }
+                    } catch (Exception e) {
+                        log.error("메시지 처리 중 오류 발생: {}", message.getMessageId(), e);
+                    }
+                }
+
+                pageNumber++;
+                if (!messages.hasNext()) {
+                    break;
+                }
+            }
+
+            // 마지막 배치 처리
+            if (!batchMessages.isEmpty()) {
+                if (sendBatchToEventHub(currentBatch)) {
+                    updateMessagesStatus(batchMessages);
+                }
+            }
+
+            long endTime = System.currentTimeMillis();
+            double totalSeconds = (endTime - startTime) / 1000.0;
+            double averageRate = processedCount / totalSeconds;
+
+            log.info("메시지 처리 완료 - 총 {} 메시지, 처리 시간: {}초, 평균 처리율: {}/sec",
+                    processedCount,
+                    String.format("%.2f", totalSeconds),
+                    String.format("%.2f", averageRate));
+
+        } catch (Exception e) {
+            log.error("메시지 처리 중 오류 발생", e);
+        }
+    }
+
+    private boolean sendBatchToEventHub(EventDataBatch batch) {
+        int retryCount = 0;
+        int maxRetries = 3;
+
+        while (retryCount < maxRetries) {
+            try {
+                eventHubProducerClient.send(batch);
+                log.info("배치 전송 완료 (size: {})", batch.getCount());
+                return true;
+            } catch (Exception e) {
+                retryCount++;
+                if (retryCount >= maxRetries) {
+                    log.error("최대 재시도 횟수 초과", e);
+                    break;
+                }
+                log.warn("배치 전송 실패, 재시도 {}/{}", retryCount, maxRetries);
+                try {
+                    Thread.sleep(1000 * retryCount);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
             }
         }
+        return false;
+    }
 
-        if (eventHubProducerClient != null) {
-            eventHubProducerClient.close();
+    @Transactional
+    protected void updateMessagesStatus(List<Message> messages) {
+        try {
+            for (Message message : messages) {
+                message.setStatus(STATUS_SENDING);
+            }
+            messageRepository.saveAll(messages);
+        } catch (Exception e) {
+            log.error("메시지 상태 업데이트 중 오류 발생", e);
+            throw e;
         }
+    }
+
+    private boolean checkConnections() {
+        try {
+            messageRepository.count();
+            eventHubProducerClient.createBatch();
+            return true;
+        } catch (Exception e) {
+            log.error("연결 확인 중 오류 발생. 다음 스케줄에서 재시도합니다.", e);
+            return false;
+        }
+    }
+
+    private EventDataBatch createNewBatch() {
+        return eventHubProducerClient.createBatch(
+                new CreateBatchOptions().setMaximumSizeInBytes(1024 * 1024)
+        );
+    }
+
+    private MessageResultEvent createMessageEvent(Message message) {
+        boolean isSuccess = random.nextInt(100) < successRate;
+
+        return MessageResultEvent.builder()
+                .messageId(message.getMessageId())
+                .status(isSuccess ? MessageResultEvent.STATUS_SENT : MessageResultEvent.STATUS_FAILED)
+                .resultCode(isSuccess ? MessageResultEvent.RESULT_CODE_SUCCESS :
+                        MessageResultEvent.RESULT_CODE_SYSTEM_ERROR)
+                .resultMessage(isSuccess ? MessageResultEvent.RESULT_MESSAGE_SUCCESS :
+                        MessageResultEvent.RESULT_MESSAGE_SYSTEM_ERROR)
+                .build();
     }
 
     private void startBatchProcessor() {
@@ -106,133 +244,23 @@ public class MessageProcessingService {
         }, batchSenderExecutor);
     }
 
-    @Scheduled(fixedDelay = 600000)
-    @Transactional
-    public void processMessages() {
-        try {
-            long startTime = System.currentTimeMillis();
-            long processedCount = 0;
-            int pageNumber = 0;
-            EventDataBatch currentBatch = createNewBatch();
-
-            // DB 연결 확인
+    @PreDestroy
+    public void cleanup() {
+        isRunning = false;
+        if (batchSenderExecutor != null) {
+            batchSenderExecutor.shutdown();
             try {
-                messageRepository.count();
-            } catch (Exception e) {
-                log.error("데이터베이스 연결 오류. 다음 스케줄에서 재시도합니다.", e);
-                return;
-            }
-
-            // 이벤트 허브 연결 확인
-            try {
-                eventHubProducerClient.createBatch();
-            } catch (Exception e) {
-                log.error("이벤트 허브 연결 오류. 다음 스케줄에서 재시도합니다.", e);
-                return;
-            }
-
-
-            log.info("메시지 처리 작업을 시작합니다. (batchSize={})", batchSize);
-
-            while (true) {
-                Page<Message> messages = messageRepository.findAll(PageRequest.of(pageNumber, batchSize));
-                if (messages.isEmpty()) {
-                    break;
+                if (!batchSenderExecutor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    batchSenderExecutor.shutdownNow();
                 }
-
-                for (Message message : messages) {
-                    try {
-                        MessageResultEvent event = createMessageEvent(message);
-                        EventData eventData = new EventData(objectMapper.writeValueAsString(event));
-
-                        if (!currentBatch.tryAdd(eventData)) {
-                            batchQueue.put(currentBatch);
-                            currentBatch = createNewBatch();
-                            if (!currentBatch.tryAdd(eventData)) {
-                                throw new RuntimeException("Event too large for empty batch");
-                            }
-                        }
-
-                        processedCount++;
-
-                        if (processedCount % 1000 == 0) {
-                            double elapsedSeconds = (System.currentTimeMillis() - startTime) / 1000.0;
-                            double rate = processedCount / elapsedSeconds;
-                            log.info("{} 메시지 처리됨, 처리율: {}/sec",
-                                    processedCount,
-                                    String.format("%.2f", rate));
-                        }
-                    } catch (Exception e) {
-                        log.error("메시지 처리 중 오류 발생: {}", message.getMessageId(), e);
-                    }
-                }
-
-                pageNumber++;
-                if (!messages.hasNext()) {
-                    break;
-                }
-            }
-
-            if (currentBatch != null && currentBatch.getCount() > 0) {
-                batchQueue.put(currentBatch);
-            }
-
-            long endTime = System.currentTimeMillis();
-            double totalSeconds = (endTime - startTime) / 1000.0;
-            double averageRate = processedCount / totalSeconds;
-
-            log.info("메시지 처리 완료 - 총 {} 메시지, 처리 시간: {}초, 평균 처리율: {}/sec",
-                    processedCount,
-                    String.format("%.2f", totalSeconds),
-                    String.format("%.2f", averageRate));
-
-        } catch (Exception e) {
-            log.error("메시지 처리 중 오류 발생", e);
-        }
-    }
-
-    private EventDataBatch createNewBatch() {
-        return eventHubProducerClient.createBatch(
-                new CreateBatchOptions().setMaximumSizeInBytes(1024 * 1024)
-        );
-    }
-
-    private void sendBatchToEventHub(EventDataBatch batch) {
-        int retryCount = 0;
-        int maxRetries = 3;
-
-        while (retryCount < maxRetries) {
-            try {
-                eventHubProducerClient.send(batch);
-                log.info("배치 전송 완료 (size: {})", batch.getCount());
-                return;
-            } catch (Exception e) {
-                retryCount++;
-                if (retryCount >= maxRetries) {
-                    log.error("최대 재시도 횟수 초과", e);
-                    break;
-                }
-                log.warn("배치 전송 실패, 재시도 {}/{}", retryCount, maxRetries);
-                try {
-                    Thread.sleep(1000 * retryCount);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
+            } catch (InterruptedException e) {
+                batchSenderExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
             }
         }
-    }
 
-    private MessageResultEvent createMessageEvent(Message message) {
-        boolean isSuccess = random.nextInt(100) < successRate;
-
-        return MessageResultEvent.builder()
-                .messageId(message.getMessageId())
-                .status(isSuccess ? MessageResultEvent.STATUS_SENT : MessageResultEvent.STATUS_FAILED)
-                .resultCode(isSuccess ? MessageResultEvent.RESULT_CODE_SUCCESS :
-                        MessageResultEvent.RESULT_CODE_SYSTEM_ERROR)
-                .resultMessage(isSuccess ? MessageResultEvent.RESULT_MESSAGE_SUCCESS :
-                        MessageResultEvent.RESULT_MESSAGE_SYSTEM_ERROR)
-                .build();
+        if (eventHubProducerClient != null) {
+            eventHubProducerClient.close();
+        }
     }
 }

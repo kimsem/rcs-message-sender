@@ -15,4 +15,7 @@ public interface MessageRepository extends JpaRepository<Message, String> {
             @Param("groupId") String messageGroupId,
             Pageable pageable
     );
+
+    Page<Message> findByStatus(String status, Pageable pageable);
+
 }
