@@ -67,69 +67,24 @@ public class MessageProcessingService {
             long processedCount = 0;
             long sentCount = 0;
 
-            // DB 및 이벤트 허브 연결 확인
             if (!checkConnections()) {
                 return;
             }
 
             log.info("PENDING 상태의 메시지 처리 작업을 시작합니다. (batchSize={})", batchSize);
 
-            boolean hasMoreMessages = true;
             int pageNumber = 0;
+            Page<Message> messagePage;
 
-            while (hasMoreMessages) {
-                // 페이지 단위로 메시지 조회
-                List<Message> messages = getPagedMessages(pageNumber);
-                if (messages.isEmpty()) {
-                    hasMoreMessages = false;
-                    continue;
+            do {
+                messagePage = getPagedMessages(pageNumber);
+                if (!messagePage.isEmpty()) {
+                    ProcessingResult result = processMessageBatch(messagePage.getContent(), startTime, processedCount, sentCount);
+                    processedCount = result.processedCount;
+                    sentCount = result.sentCount;
                 }
-
-                List<String> messageIds = new ArrayList<>(updateBatchSize);
-                EventDataBatch currentBatch = createNewBatch();
-
-                for (Message message : messages) {
-                    try {
-                        MessageResultEvent event = createMessageEvent(message);
-                        EventData eventData = new EventData(objectMapper.writeValueAsString(event));
-                        processedCount++;
-
-                        if (!currentBatch.tryAdd(eventData)) {
-                            processBatch(currentBatch, messageIds, processedCount);
-                            sentCount += currentBatch.getCount();
-                            messageIds.clear();
-
-                            currentBatch = createNewBatch();
-                            if (!currentBatch.tryAdd(eventData)) {
-                                throw new RuntimeException("Event too large for empty batch");
-                            }
-                        }
-
-                        messageIds.add(message.getMessageId());
-
-                        if (messageIds.size() >= updateBatchSize) {
-                            processBatch(currentBatch, messageIds, processedCount);
-                            sentCount += currentBatch.getCount();
-                            messageIds.clear();
-                            currentBatch = createNewBatch();
-                        }
-
-                        if (processedCount % 1000 == 0) {
-                            logProgress(processedCount, sentCount, startTime);
-                        }
-                    } catch (Exception e) {
-                        log.error("메시지 처리 중 오류 발생: {}", message.getMessageId(), e);
-                    }
-                }
-
-                // 남은 메시지 처리
-                if (!messageIds.isEmpty()) {
-                    processBatch(currentBatch, messageIds, processedCount);
-                    sentCount += currentBatch.getCount();
-                }
-
                 pageNumber++;
-            }
+            } while (messagePage.hasNext());
 
             logCompletion(processedCount, sentCount, startTime);
 
@@ -139,27 +94,166 @@ public class MessageProcessingService {
     }
 
     @Transactional(readOnly = true)
-    protected List<Message> getPagedMessages(int pageNumber) {
-        Page<Message> messagePage = messageRepository.findByStatus(STATUS_PENDING,
-                PageRequest.of(pageNumber, batchSize));
-        return messagePage.getContent();
-    }
-
-    @Transactional
-    protected void processBatch(EventDataBatch batch, List<String> messageIds, long processedCount) {
-        if (sendBatchToEventHub(batch)) {
-            updateMessageStatuses(messageIds);
-            log.info("배치 전송 완료 - 전송건수: {}, 총 처리건수: {}", batch.getCount(), processedCount);
+    protected Page<Message> getPagedMessages(int pageNumber) {
+        try {
+            return messageRepository.findByStatus(STATUS_PENDING, PageRequest.of(pageNumber, batchSize));
+        } catch (Exception e) {
+            log.error("메시지 조회 중 오류 발생. pageNumber: {}", pageNumber, e);
+            throw e;
         }
     }
 
+    private ProcessingResult processMessageBatch(List<Message> messages, long startTime,
+                                                 long currentProcessedCount, long currentSentCount) {
+        List<String> messageIds = new ArrayList<>(updateBatchSize);
+        EventDataBatch currentBatch = null;
+        long processedCount = currentProcessedCount;
+        long sentCount = currentSentCount;
+
+        try {
+            currentBatch = createNewBatch();
+
+            for (Message message : messages) {
+                try {
+                    MessageResultEvent event = createMessageEvent(message);
+                    EventData eventData = new EventData(objectMapper.writeValueAsString(event));
+                    processedCount++;
+
+                    if (currentBatch == null || !currentBatch.tryAdd(eventData)) {
+                        if (currentBatch != null) {
+                            if (processBatchWithTransaction(currentBatch, messageIds)) {
+                                sentCount += currentBatch.getCount();
+                            }
+                            messageIds.clear();
+                        }
+                        currentBatch = createNewBatch();
+                        if (!currentBatch.tryAdd(eventData)) {
+                            log.error("이벤트가 최대 배치 크기를 초과합니다: {}", message.getMessageId());
+                            continue;
+                        }
+                    }
+
+                    messageIds.add(message.getMessageId());
+
+                    if (messageIds.size() >= updateBatchSize) {
+                        if (processBatchWithTransaction(currentBatch, messageIds)) {
+                            sentCount += currentBatch.getCount();
+                        }
+                        messageIds.clear();
+                        currentBatch = createNewBatch();
+                    }
+
+                    if (processedCount % 1000 == 0) {
+                        logProgress(processedCount, sentCount, startTime);
+                    }
+                } catch (Exception e) {
+                    log.error("메시지 처리 중 오류 발생: {}", message.getMessageId(), e);
+                }
+            }
+
+            // 남은 메시지 처리
+            if (!messageIds.isEmpty() && currentBatch != null) {
+                if (processBatchWithTransaction(currentBatch, messageIds)) {
+                    sentCount += currentBatch.getCount();
+                }
+            }
+        } finally {
+            currentBatch = null;
+        }
+
+        return new ProcessingResult(processedCount, sentCount);
+    }
+
+    @Transactional
+    protected boolean processBatchWithTransaction(EventDataBatch batch, List<String> messageIds) {
+        try {
+            if (sendBatchToEventHub(batch)) {
+                updateMessageStatuses(messageIds);
+                log.info("배치 전송 완료 - 전송건수: {}", batch.getCount());
+                return true;
+            }
+            return false;
+        } finally {
+            if (batch != null) {
+                batch = null;
+            }
+        }
+    }
+
+    @Transactional  // 이 메소드에도 추가
     private void updateMessageStatuses(List<String> messageIds) {
         try {
-            messageRepository.updateMessagesStatus(new ArrayList<>(messageIds), STATUS_SENDING);
+            messageRepository.updateMessagesStatus(messageIds, STATUS_SENDING);
         } catch (Exception e) {
             log.error("메시지 상태 업데이트 중 오류 발생. messageIds: {}", messageIds.size(), e);
             throw e;
         }
+    }
+
+    private boolean sendBatchToEventHub(EventDataBatch batch) {
+        if (batch == null || batch.getCount() == 0) {
+            return false;
+        }
+
+        int retryCount = 0;
+        int maxRetries = 3;
+
+        while (retryCount < maxRetries) {
+            try {
+                eventHubProducerClient.send(batch);
+                log.debug("이벤트 허브 전송 성공 - 배치 크기: {}, 배치 bytes: {}",
+                        batch.getCount(), batch.getSizeInBytes());
+                return true;
+            } catch (Exception e) {
+                retryCount++;
+                log.error("이벤트 허브 전송 실패 (시도 {}/{}) - 오류: {}",
+                        retryCount, maxRetries, e.getMessage());
+
+                if (retryCount >= maxRetries) {
+                    break;
+                }
+
+                try {
+                    Thread.sleep((long) (1000 * Math.pow(2, retryCount)));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    private EventDataBatch createNewBatch() {
+        return eventHubProducerClient.createBatch(
+                new CreateBatchOptions()
+                        .setMaximumSizeInBytes(1024 * 1024));
+    }
+
+    private boolean checkConnections() {
+        try {
+            // 단순 count 쿼리 실행
+            messageRepository.count();
+            eventHubProducerClient.createBatch();
+            return true;
+        } catch (Exception e) {
+            log.error("연결 확인 중 오류 발생. 다음 스케줄에서 재시도합니다.", e);
+            return false;
+        }
+    }
+
+
+    private MessageResultEvent createMessageEvent(Message message) {
+        boolean isSuccess = random.nextInt(100) < successRate;
+
+        return MessageResultEvent.builder()
+                .messageId(message.getMessageId())
+                .status(isSuccess ? MessageResultEvent.STATUS_SENT : MessageResultEvent.STATUS_FAILED)
+                .resultCode(isSuccess ? MessageResultEvent.RESULT_CODE_SUCCESS :
+                        MessageResultEvent.RESULT_CODE_SYSTEM_ERROR)
+                .resultMessage(isSuccess ? MessageResultEvent.RESULT_MESSAGE_SUCCESS :
+                        MessageResultEvent.RESULT_MESSAGE_SYSTEM_ERROR)
+                .build();
     }
 
     private void logProgress(long processedCount, long sentCount, long startTime) {
@@ -181,66 +275,24 @@ public class MessageProcessingService {
                 String.format("%.2f", averageRate));
     }
 
-    private boolean sendBatchToEventHub(EventDataBatch batch) {
-        int retryCount = 0;
-        int maxRetries = 3;
-
-        while (retryCount < maxRetries) {
-            try {
-                eventHubProducerClient.send(batch);
-                return true;
-            } catch (Exception e) {
-                retryCount++;
-                if (retryCount >= maxRetries) {
-                    log.error("최대 재시도 횟수 초과", e);
-                    break;
-                }
-                log.warn("배치 전송 실패, 재시도 {}/{}", retryCount, maxRetries);
-                try {
-                    Thread.sleep(1000 * retryCount);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-            }
-        }
-        return false;
-    }
-
-    private EventDataBatch createNewBatch() {
-        return eventHubProducerClient.createBatch(
-                new CreateBatchOptions().setMaximumSizeInBytes(1024 * 1024)
-        );
-    }
-
-    private boolean checkConnections() {
-        try {
-            messageRepository.count();
-            eventHubProducerClient.createBatch();
-            return true;
-        } catch (Exception e) {
-            log.error("연결 확인 중 오류 발생. 다음 스케줄에서 재시도합니다.", e);
-            return false;
-        }
-    }
-
-    private MessageResultEvent createMessageEvent(Message message) {
-        boolean isSuccess = random.nextInt(100) < successRate;
-
-        return MessageResultEvent.builder()
-                .messageId(message.getMessageId())
-                .status(isSuccess ? MessageResultEvent.STATUS_SENT : MessageResultEvent.STATUS_FAILED)
-                .resultCode(isSuccess ? MessageResultEvent.RESULT_CODE_SUCCESS :
-                        MessageResultEvent.RESULT_CODE_SYSTEM_ERROR)
-                .resultMessage(isSuccess ? MessageResultEvent.RESULT_MESSAGE_SUCCESS :
-                        MessageResultEvent.RESULT_MESSAGE_SYSTEM_ERROR)
-                .build();
-    }
-
     @PreDestroy
     public void cleanup() {
         if (eventHubProducerClient != null) {
-            eventHubProducerClient.close();
+            try {
+                eventHubProducerClient.close();
+            } catch (Exception e) {
+                log.error("EventHub Producer 종료 중 오류 발생", e);
+            }
+        }
+    }
+
+    private static class ProcessingResult {
+        final long processedCount;
+        final long sentCount;
+
+        ProcessingResult(long processedCount, long sentCount) {
+            this.processedCount = processedCount;
+            this.sentCount = sentCount;
         }
     }
 }

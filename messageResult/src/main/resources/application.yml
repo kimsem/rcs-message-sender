@@ -8,21 +8,29 @@ spring:
     password: ${MESSAGE_DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
     hikari:
-      maximum-pool-size: 10
-      minimum-idle: 5
+      maximum-pool-size: 5
+      minimum-idle: 2
       idle-timeout: 300000       # 5분
-      max-lifetime: 600000       # 10분 (기존 20분에서 줄임)
-      connection-timeout: 20000
+      max-lifetime: 600000       # 10분
+      connection-timeout: 20000  # 20초
       validation-timeout: 5000
       connection-test-query: SELECT 1
       pool-name: HikariPool
-      connection-init-sql: SELECT 1
+      leak-detection-threshold: 30000  # 커넥션 누수 감지 (30초)
+      auto-commit: false
+      data-source-properties: # 추가: PostgreSQL 특정 설정
+        reWriteBatchedInserts: true
   jpa:
     properties:
       hibernate:
-        format_sql: true             # SQL 포맷팅
-        use_sql_comments: true       # JPQL 주석 출력
-    show-sql: true                   # SQL 콘솔 출력
+        jdbc:
+          batch_size: 100
+          batch_versioned_data: true
+        order_inserts: true
+        order_updates: true
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    open-in-view: false
 
 
 message:
@@ -58,3 +66,5 @@ logging:
     org.hibernate.type.descriptor.sql: TRACE  # SQL 쿼리 파라미터 값까지 출력
     org.springframework: WARN
     org.hibernate.orm.jdbc.bind: TRACE # 바인딩 파라미터 출력 (Hibernate 6.x 이상)
+    com.azure.messaging.eventhubs: DEBUG    # Event Hub 상세 로깅
+    com.rcs.external.service: DEBUG         # 서비스 레벨 로깅
