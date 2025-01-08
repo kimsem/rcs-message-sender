@@ -52,7 +52,7 @@ eventhub:
   connectionString: ${EVENTHUB_CONNECTION_STRING}
 
 rcs:
-  successRate: 98
+  successRate: 99
 
 springdoc:
   swagger-ui:
