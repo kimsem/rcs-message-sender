@@ -39,6 +39,8 @@ public class MessageProcessingService {
     private final int successRate;
     private final int updateBatchSize;
 
+
+
     public MessageProcessingService(
             MessageRepository messageRepository,
             @Value("${message.processing.default-batch-size:5000}") int batchSize,
@@ -196,7 +198,7 @@ public class MessageProcessingService {
         }
 
         int retryCount = 0;
-        int maxRetries = 3;
+        int maxRetries = 5;
 
         while (retryCount < maxRetries) {
             try {
@@ -206,19 +208,35 @@ public class MessageProcessingService {
                 return true;
             } catch (Exception e) {
                 retryCount++;
-                log.error("이벤트 허브 전송 실패 (시도 {}/{}) - 오류: {}",
-                        retryCount, maxRetries, e.getMessage());
 
-                if (retryCount >= maxRetries) {
+                if ( e.getMessage().contains("50002")){
+                    log.warn("이벤트 허브 처리량 제한 발생 - 4초 대기 후 재시도 ({}/{})",
+                            retryCount, maxRetries);
+                    try {
+                        Thread.sleep(4000); // 4초 대기
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }else{
+                    log.error("이벤트 허브 전송 실패 (시도 {}/{}) - 오류: {}",
+                            retryCount, maxRetries, e.getMessage());
+
+                    if (retryCount >= maxRetries) {
+                        break;
+                    }
+
+                    try {
+                        Thread.sleep((long) (1000 * Math.pow(2, retryCount)));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+                if ( retryCount >= maxRetries ){
                     break;
                 }
 
-                try {
-                    Thread.sleep((long) (1000 * Math.pow(2, retryCount)));
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
             }
         }
         return false;
